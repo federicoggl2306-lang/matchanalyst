@@ -1,0 +1,7 @@
+{
+  "name": "match-analyst-bot",
+  "version": "1.0.0",
+  "main": "analyst.js",
+  "scripts": { "start": "node analyst.js" },
+  "engines": { "node": ">=16" }
+}
