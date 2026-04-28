@@ -99,32 +99,33 @@ function todayDate() {
   return new Date().toISOString().split("T")[0];
 }
 
-// Cerca partite per data in tutte le top leghe
+// Cerca partite — ottimizzata per piano free (poche chiamate API)
 async function fetchMatchesByDate(dateStr) {
+  // Prima prova live=all — una sola chiamata
+  try {
+    const liveData = await apiFootball("/fixtures?live=all");
+    const live = liveData.response || [];
+    console.log(`Live=all: ${live.length} partite`);
+    if (live.length > 0) return live;
+  } catch(e) {}
+
+  // Fallback: solo UCL + 3 top leghe = max 4 chiamate
+  const LEGHE_PRIORITARIE = [2, 3, 135, 39, 140, 78];
   let allMatches = [];
-  for (const leagueId of TOP_LEAGUES) {
+  for (const leagueId of LEGHE_PRIORITARIE) {
     try {
       const data = await apiFootball(`/fixtures?league=${leagueId}&season=${SEASON}&date=${dateStr}`);
       const matches = data.response || [];
       console.log(`Lega ${leagueId} (${dateStr}): ${matches.length} partite`);
       allMatches = allMatches.concat(matches);
-    } catch(e) { console.error(`Errore lega ${leagueId}:`, e.message); }
+    } catch(e) {}
   }
   return allMatches;
 }
 
-// Partite di oggi nelle top leghe (con fallback giorni successivi)
+// Partite di oggi (una sola chiamata live, poi fallback data singola)
 async function getTopMatchesToday() {
-  let allMatches = await fetchMatchesByDate(todayDate());
-
-  if (allMatches.length === 0) {
-    for (let i = 1; i <= 2; i++) {
-      const d = new Date(); d.setDate(d.getDate() + i);
-      allMatches = await fetchMatchesByDate(d.toISOString().split("T")[0]);
-      if (allMatches.length > 0) break;
-    }
-  }
-
+  const allMatches = await fetchMatchesByDate(todayDate());
   const grouped = {};
   for (const f of allMatches) {
     const league = f.league.name;
@@ -134,13 +135,9 @@ async function getTopMatchesToday() {
   return grouped;
 }
 
-// Cerca partita per nome squadra (per il flusso manuale con dati reali)
+// Cerca partita per nome — usa solo i risultati già caricati
 async function searchFixtureByTeam(query) {
-  let allMatches = await fetchMatchesByDate(todayDate());
-  for (let i = 1; i <= 3; i++) {
-    const d = new Date(); d.setDate(d.getDate() + i);
-    allMatches = allMatches.concat(await fetchMatchesByDate(d.toISOString().split("T")[0]));
-  }
+  const allMatches = await fetchMatchesByDate(todayDate());
   return allMatches.filter(f =>
     f.teams.home.name.toLowerCase().includes(query.toLowerCase()) ||
     f.teams.away.name.toLowerCase().includes(query.toLowerCase())
