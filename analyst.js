@@ -1,6 +1,6 @@
 // ============================================
-// MATCH ANALYST BOT v3 - Riscritto da zero
-// Dati reali, testo pulito, classifica inclusa
+// MATCH ANALYST BOT v4
+// Dati reali API Football + AI solo per commenti tattici
 // ============================================
 
 const https = require("https");
@@ -14,28 +14,15 @@ let lastUpdateId = 0;
 let waitingFor = null;
 let matchData = {};
 
-// Leghe top — filtriamo solo queste per /analisi
 const TOP_LEAGUES = [2, 3, 848, 135, 39, 140, 78, 61, 94, 88, 203];
-
-const LEAGUE_EMOJI = {
-  "UEFA Champions League": "🏆",
-  "UEFA Europa League": "🟠",
-  "UEFA Europa Conference League": "🟢",
-  "Serie A": "🇮🇹",
-  "Premier League": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
-  "La Liga": "🇪🇸",
-  "Bundesliga": "🇩🇪",
-  "Ligue 1": "🇫🇷",
-  "Primeira Liga": "🇵🇹",
-  "Eredivisie": "🇳🇱",
-};
+const SEASON = new Date().getFullYear();
 
 // ============================================
 // TELEGRAM
 // ============================================
 
 function sendTelegram(text, extra = {}) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const payload = { chat_id: CHAT_ID, text, parse_mode: "HTML", ...extra };
     const body = JSON.stringify(payload);
     const opts = {
@@ -45,10 +32,9 @@ function sendTelegram(text, extra = {}) {
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
     };
     const req = https.request(opts, (res) => {
-      let data = ""; res.on("data", c => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { resolve({}); } });
+      let d = ""; res.on("data", c => d += c); res.on("end", () => resolve());
     });
-    req.on("error", reject); req.write(body); req.end();
+    req.on("error", () => resolve()); req.write(body); req.end();
   });
 }
 
@@ -70,7 +56,6 @@ function answerCallback(id) {
   });
 }
 
-// Spezza messaggi lunghi (limite Telegram 4096 char)
 async function sendLong(text) {
   const MAX = 4000;
   if (text.length <= MAX) { await sendTelegram(text); return; }
@@ -112,16 +97,18 @@ function todayDate() {
   return new Date().toISOString().split("T")[0];
 }
 
-// Partite di oggi nelle top leghe (sia live che programmate)
+// Partite di oggi nelle top leghe
 async function getTopMatchesToday() {
   const date = todayDate();
-  const data = await apiFootball(`/fixtures?date=${date}&timezone=Europe/Rome`);
-  const all = data.response || [];
-  const top = all.filter(f => TOP_LEAGUES.includes(f.league.id));
-
-  // Raggruppa per lega
+  let allMatches = [];
+  for (const leagueId of TOP_LEAGUES) {
+    try {
+      const data = await apiFootball(`/fixtures?league=${leagueId}&season=${SEASON}&date=${date}`);
+      allMatches = allMatches.concat(data.response || []);
+    } catch(e) {}
+  }
   const grouped = {};
-  for (const f of top) {
+  for (const f of allMatches) {
     const league = f.league.name;
     if (!grouped[league]) grouped[league] = [];
     grouped[league].push(f);
@@ -129,115 +116,202 @@ async function getTopMatchesToday() {
   return grouped;
 }
 
-// Classifica della lega per trovare la posizione delle due squadre
-async function getStandings(leagueId, season) {
+// ============================================
+// RACCOLTA DATI REALI
+// ============================================
+
+async function getRealData(fixtureId) {
+  const result = {
+    fixture: null,
+    homeStandings: null,
+    awayStandings: null,
+    homeForm: [],
+    awayForm: [],
+    h2h: [],
+    errors: [],
+  };
+
+  // 1. Dettagli fixture
+  try {
+    const data = await apiFootball(`/fixtures?id=${fixtureId}`);
+    result.fixture = data.response?.[0] || null;
+  } catch(e) { result.errors.push("fixture"); }
+
+  if (!result.fixture) return result;
+
+  const homeId = result.fixture.teams.home.id;
+  const awayId = result.fixture.teams.away.id;
+  const leagueId = result.fixture.league.id;
+  const season = result.fixture.league.season;
+
+  // 2. Classifica
   try {
     const data = await apiFootball(`/standings?league=${leagueId}&season=${season}`);
-    const standings = data.response?.[0]?.league?.standings?.[0] || [];
-    return standings;
-  } catch(e) { return []; }
-}
+    const table = data.response?.[0]?.league?.standings?.[0] || [];
+    result.homeStandings = table.find(s => s.team.id === homeId) || null;
+    result.awayStandings = table.find(s => s.team.id === awayId) || null;
+  } catch(e) { result.errors.push("standings"); }
 
-// Ultimi 5 risultati di una squadra
-async function getLastFive(teamId, leagueId, season) {
+  // 3. Ultimi 5 risultati
   try {
-    const data = await apiFootball(`/fixtures?team=${teamId}&league=${leagueId}&season=${season}&last=5`);
-    return data.response || [];
-  } catch(e) { return []; }
-}
+    const data = await apiFootball(`/fixtures?team=${homeId}&league=${leagueId}&season=${season}&last=5&status=FT`);
+    result.homeForm = data.response || [];
+  } catch(e) { result.errors.push("homeForm"); }
 
-// Head to head ultimi 10 scontri
-async function getH2H(homeId, awayId) {
   try {
-    const data = await apiFootball(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`);
-    return data.response || [];
-  } catch(e) { return []; }
-}
+    const data = await apiFootball(`/fixtures?team=${awayId}&league=${leagueId}&season=${season}&last=5&status=FT`);
+    result.awayForm = data.response || [];
+  } catch(e) { result.errors.push("awayForm"); }
 
-// Formatta risultato singola partita (per forma recente)
-function formatResult(fixture, teamId) {
-  const home = fixture.teams.home;
-  const away = fixture.teams.away;
-  const gh = fixture.goals.home ?? 0;
-  const ga = fixture.goals.away ?? 0;
-  const isHome = home.id === teamId;
-  const teamGoals = isHome ? gh : ga;
-  const oppGoals = isHome ? ga : gh;
-  const opp = isHome ? away.name : home.name;
-  let result = teamGoals > oppGoals ? "✅" : teamGoals === oppGoals ? "🟡" : "❌";
-  const date = new Date(fixture.fixture.date).toLocaleDateString("it-IT", { day:"2-digit", month:"2-digit" });
-  return `${result} ${date} vs ${opp}: ${teamGoals}-${oppGoals}`;
+  // 4. H2H
+  try {
+    const data = await apiFootball(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=8`);
+    result.h2h = data.response || [];
+  } catch(e) { result.errors.push("h2h"); }
+
+  return result;
 }
 
 // ============================================
-// GROQ AI — Genera analisi con dati reali iniettati
+// FORMATTAZIONE DATI REALI IN TESTO
 // ============================================
 
-async function generateAnalysis(match, extraData) {
-  const {
-    homeStanding, awayStanding,
-    homeForm, awayForm,
-    h2hText,
-  } = extraData;
+function formatStanding(s, teamName) {
+  if (!s) return `${teamName}: classifica non disponibile`;
+  return `${s.rank}° posto | ${s.points} punti | ${s.all.played} partite | ${s.all.win}V-${s.all.draw}P-${s.all.lose}S | Gol: ${s.all.goals.for}-${s.all.goals.against} | DR: ${s.goalsDiff > 0 ? "+" : ""}${s.goalsDiff}`;
+}
 
-  const prompt = `Sei un Match Analyst di calcio professionista. Scrivi un report pre-partita in italiano, chiaro, ben strutturato e leggibile. Usa i dati reali qui sotto e integra con la tua conoscenza tattica delle squadre.
+function formatFormLine(fixtures, teamId, teamName) {
+  if (!fixtures || fixtures.length === 0) return `${teamName}: dati forma non disponibili`;
+  const results = fixtures.map(f => {
+    const isHome = f.teams.home.id === teamId;
+    const myGoals = isHome ? f.goals.home : f.goals.away;
+    const oppGoals = isHome ? f.goals.away : f.goals.home;
+    const opp = isHome ? f.teams.away.name : f.teams.home.name;
+    const date = new Date(f.fixture.date).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" });
+    let esito = myGoals > oppGoals ? "V" : myGoals === oppGoals ? "P" : "S";
+    return `${esito} ${date} vs ${opp} ${myGoals}-${oppGoals}`;
+  });
+  const wins = results.filter(r => r.startsWith("V")).length;
+  const draws = results.filter(r => r.startsWith("P")).length;
+  const losses = results.filter(r => r.startsWith("S")).length;
+  return `${teamName}: ${wins}V ${draws}P ${losses}S nelle ultime ${fixtures.length}\n  ${results.join(" | ")}`;
+}
 
-═══════════════════════════
-PARTITA: ${match.home} vs ${match.away}
-COMPETIZIONE: ${match.competition}
-DATA: ${match.date}
-═══════════════════════════
+function formatH2H(h2h, homeName, awayName) {
+  if (!h2h || h2h.length === 0) return "Nessun precedente disponibile";
+  let homeWins = 0, awayWins = 0, draws = 0, totalGoals = 0;
+  const lines = h2h.map(f => {
+    const gh = f.goals.home ?? 0;
+    const ga = f.goals.away ?? 0;
+    totalGoals += gh + ga;
+    if (gh > ga) homeWins++; else if (ga > gh) awayWins++; else draws++;
+    const date = new Date(f.fixture.date).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "2-digit" });
+    return `${date}: ${f.teams.home.name} ${gh}-${ga} ${f.teams.away.name}`;
+  });
+  const mediaGol = (totalGoals / h2h.length).toFixed(1);
+  return `Ultimi ${h2h.length} scontri: ${homeName} ${homeWins}V | Pareggi ${draws} | ${awayName} ${awayWins}V | Media gol: ${mediaGol}\n  ${lines.join(" | ")}`;
+}
 
-DATI REALI FORNITI:
-• ${match.home} in classifica: ${homeStanding}
-• ${match.away} in classifica: ${awayStanding}
-• Ultimi 5 risultati ${match.home}: ${homeForm}
-• Ultimi 5 risultati ${match.away}: ${awayForm}
-• Head to Head (ultimi scontri): ${h2hText}
+// ============================================
+// COSTRUISCE IL REPORT (dati reali + AI per tattica)
+// ============================================
 
-═══════════════════════════
-STRUTTURA REPORT (segui esattamente):
+async function buildReport(fixtureId) {
+  // Step 1: raccogli dati reali
+  const data = await getRealData(fixtureId);
 
-1️⃣ CONTESTO E POSTA IN GIOCO
-Spiega cosa significa questa partita per entrambe le squadre (classifica, obiettivi stagionali, rivalità).
+  if (!data.fixture) {
+    throw new Error("Impossibile recuperare i dati della partita");
+  }
 
-2️⃣ FORMA RECENTE
-Per ogni squadra analizza i risultati reali forniti sopra: quanti punti nelle ultime 5, gol fatti/subiti, trend (in salita o in calo). Sii specifico con i numeri.
+  const home = data.fixture.teams.home.name;
+  const away = data.fixture.teams.away.name;
+  const league = data.fixture.league.name;
+  const date = new Date(data.fixture.fixture.date).toLocaleDateString("it-IT", {
+    weekday: "long", day: "2-digit", month: "long", year: "numeric", timeZone: "Europe/Rome"
+  });
+  const time = new Date(data.fixture.fixture.date).toLocaleTimeString("it-IT", {
+    hour: "2-digit", minute: "2-digit", timeZone: "Europe/Rome"
+  });
 
-3️⃣ CLASSIFICA
-Indica la posizione attuale di entrambe le squadre con punti, partite giocate, differenza reti. Spiega il gap tra le due.
+  // Step 2: formatta i dati reali
+  const standingHome = formatStanding(data.homeStandings, home);
+  const standingAway = formatStanding(data.awayStandings, away);
+  const formHome = formatFormLine(data.homeForm, data.fixture.teams.home.id, home);
+  const formAway = formatFormLine(data.awayForm, data.fixture.teams.away.id, away);
+  const h2hText = formatH2H(data.h2h, home, away);
 
-4️⃣ HEAD TO HEAD
-Analizza gli scontri diretti forniti: chi ha vinto di più, media gol, pattern ricorrenti (es. partite sempre equilibrate, una squadra dominante, tanti gol).
+  // Step 3: costruisci la sezione dati reali direttamente (senza AI per questa parte)
+  const headerBlock =
+    `⚽ <b>${home} vs ${away}</b>\n` +
+    `🏆 ${league}\n` +
+    `📅 ${date} — ore ${time}\n`;
 
-5️⃣ ANALISI TATTICA
-${match.home}: modulo probabile, stile di gioco, punti di forza.
-${match.away}: modulo probabile, stile di gioco, punti di forza.
-Identifica 2-3 duelli chiave che possono decidere la partita.
+  const classificaBlock =
+    `📊 <b>CLASSIFICA</b>\n` +
+    `🏠 ${standingHome}\n` +
+    `✈️ ${standingAway}`;
 
-6️⃣ ASSENZE E GIOCATORI CHIAVE
-Elenca infortuni/squalifiche noti e i giocatori più in forma di entrambe le squadre in questo momento.
+  const formaBlock =
+    `📈 <b>FORMA RECENTE</b>\n` +
+    `🏠 ${formHome}\n` +
+    `✈️ ${formAway}`;
 
-7️⃣ PRONOSTICO
-Come si svilupperà la partita? Chi favorito e perché? Esito più probabile con motivazione chiara basata sui dati.
+  const h2hBlock =
+    `🔄 <b>HEAD TO HEAD</b>\n` +
+    `${h2hText}`;
 
-━━━━━━━━━━━━━━━━━━━━━━
-🔒 QUOTA SICURA
-Identifica la scommessa statisticamente più solida per questa partita (Over/Under, BTTS, 1X2, handicap...).
-Formato: 
-• Tipo: [es. Over 2.5]
-• Motivazione: [2-3 righe con i dati che la supportano]  
-• Confidenza: [X/10]
-━━━━━━━━━━━━━━━━━━━━━━
+  // Step 4: chiedi all'AI SOLO la parte tattica (che non può sbagliare perché è opinione)
+  const tacticalAnalysis = await askGroqTactics(home, away, league, standingHome, standingAway, formHome, formAway, h2hText);
 
-IMPORTANTE: scrivi in modo chiaro e leggibile. Usa a capo tra le sezioni. Niente muri di testo. Sii diretto e concreto.`;
+  // Step 5: assembla il report finale
+  const report =
+    `${headerBlock}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `${classificaBlock}\n\n` +
+    `${formaBlock}\n\n` +
+    `${h2hBlock}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `${tacticalAnalysis}`;
 
-  return new Promise((resolve, reject) => {
+  return report;
+}
+
+// ============================================
+// GROQ — SOLO TATTICA E PRONOSTICO
+// ============================================
+
+async function askGroqTactics(home, away, league, standHome, standAway, formHome, formAway, h2h) {
+  const prompt =
+    `Sei un analista tattico di calcio. Ti fornisco i DATI REALI di una partita. ` +
+    `Il tuo compito è scrivere SOLO le sezioni tattiche che seguono, senza ripetere i dati che ti ho già dato.\n\n` +
+    `DATI REALI (non ripetere questi nel testo):\n` +
+    `Partita: ${home} vs ${away} — ${league}\n` +
+    `Classifica ${home}: ${standHome}\n` +
+    `Classifica ${away}: ${standAway}\n` +
+    `Forma ${home}: ${formHome}\n` +
+    `Forma ${away}: ${formAway}\n` +
+    `H2H: ${h2h}\n\n` +
+    `Scrivi ESATTAMENTE queste 4 sezioni in italiano, testo pulito senza eccesso di emoji:\n\n` +
+    `🎯 ANALISI TATTICA\n` +
+    `[Modulo e stile di gioco di ${home}. Modulo e stile di gioco di ${away}. 2-3 duelli chiave che possono decidere la partita. Max 8 righe totali.]\n\n` +
+    `👤 GIOCATORI CHIAVE E ASSENZE\n` +
+    `[Giocatori più in forma e assenze note di entrambe le squadre. Max 6 righe.]\n\n` +
+    `🔮 PRONOSTICO\n` +
+    `[Basandoti SUI DATI REALI forniti sopra, spiega come prevedi si svilupperà la partita e qual è l'esito più probabile. Sii specifico e cita i numeri. Max 6 righe.]\n\n` +
+    `🔒 QUOTA SICURA\n` +
+    `Tipo scommessa: [es. Over 2.5 / BTTS / 1X2]\n` +
+    `Motivazione: [2 righe con riferimento ai dati reali]\n` +
+    `Confidenza: [X/10]\n\n` +
+    `IMPORTANTE: scrivi in modo diretto e concreto. Niente frasi generiche. Cita sempre i dati reali nel pronostico.`;
+
+  return new Promise((resolve) => {
     const body = JSON.stringify({
       model: "llama-3.3-70b-versatile",
-      max_tokens: 4000,
+      max_tokens: 1500,
       messages: [
-        { role: "system", content: "Sei un Match Analyst professionista. Rispondi in italiano. Scrivi in modo chiaro, strutturato e leggibile. Usa i dati reali forniti." },
+        { role: "system", content: "Sei un analista tattico di calcio professionista. Scrivi in italiano. Sii diretto e concreto. Usa i dati reali forniti." },
         { role: "user", content: prompt },
       ],
     });
@@ -251,85 +325,35 @@ IMPORTANTE: scrivi in modo chiaro e leggibile. Usa a capo tra le sezioni. Niente
         "Content-Length": Buffer.byteLength(body),
       },
     };
-    const req = https.request(opts, (res) => {
-      let data = ""; res.on("data", c => data += c);
+    const req = opts => new Promise((res, rej) => {
+      const r = https.request(opts, (response) => {
+        let d = ""; response.on("data", c => d += c);
+        response.on("end", () => { try { res(JSON.parse(d)); } catch(e) { rej(e); } });
+      });
+      r.on("error", rej); r.write(body); r.end();
+      return r;
+    });
+
+    https.request({
+      hostname: "api.groq.com",
+      path: "/openai/v1/chat/completions",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GROQ_KEY}`,
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let d = ""; res.on("data", c => d += c);
       res.on("end", () => {
         try {
-          const parsed = JSON.parse(data);
-          resolve(parsed.choices?.[0]?.message?.content || "Errore nella generazione.");
-        } catch(e) { reject(e); }
+          const parsed = JSON.parse(d);
+          resolve(parsed.choices?.[0]?.message?.content || "Analisi tattica non disponibile.");
+        } catch(e) { resolve("Analisi tattica non disponibile."); }
       });
-    });
-    req.on("error", reject); req.write(body); req.end();
+    }).on("error", () => resolve("Analisi tattica non disponibile."))
+      .end(body);
   });
-}
-
-// ============================================
-// PREPARA DATI REALI E GENERA ANALISI
-// ============================================
-
-async function prepareAndAnalyze(fixtureId, home, away, competition, date) {
-  // Step 1 — Dettagli fixture
-  const fixtureData = await apiFootball(`/fixtures?id=${fixtureId}`);
-  const f = fixtureData.response?.[0];
-  const homeId = f?.teams?.home?.id;
-  const awayId = f?.teams?.away?.id;
-  const leagueId = f?.league?.id;
-  const season = f?.league?.season;
-
-  await sendTelegram(`🔍 <i>Raccogliendo dati reali per ${home} vs ${away}...</i>`);
-
-  // Step 2 — Classifica
-  const standings = await getStandings(leagueId, season);
-  const homeS = standings.find(s => s.team.id === homeId);
-  const awayS = standings.find(s => s.team.id === awayId);
-
-  const homeStanding = homeS
-    ? `${homeS.rank}° posto — ${homeS.points} punti in ${homeS.all.played} partite (${homeS.all.win}V ${homeS.all.draw}P ${homeS.all.lose}S) DR: ${homeS.goalsDiff}`
-    : "classifica non disponibile";
-
-  const awayStanding = awayS
-    ? `${awayS.rank}° posto — ${awayS.points} punti in ${awayS.all.played} partite (${awayS.all.win}V ${awayS.all.draw}P ${awayS.all.lose}S) DR: ${awayS.goalsDiff}`
-    : "classifica non disponibile";
-
-  // Step 3 — Ultimi 5 risultati
-  const [homeResults, awayResults] = await Promise.all([
-    getLastFive(homeId, leagueId, season),
-    getLastFive(awayId, leagueId, season),
-  ]);
-
-  const homeForm = homeResults.length > 0
-    ? homeResults.map(fx => formatResult(fx, homeId)).join(" | ")
-    : "dati non disponibili";
-
-  const awayForm = awayResults.length > 0
-    ? awayResults.map(fx => formatResult(fx, awayId)).join(" | ")
-    : "dati non disponibili";
-
-  // Step 4 — Head to head
-  const h2h = await getH2H(homeId, awayId);
-  let h2hText = "";
-  if (h2h.length === 0) {
-    h2hText = "Nessuno scontro diretto recente disponibile";
-  } else {
-    h2hText = h2h.slice(0, 8).map(fx => {
-      const gh = fx.goals.home ?? 0;
-      const ga = fx.goals.away ?? 0;
-      const hName = fx.teams.home.name;
-      const aName = fx.teams.away.name;
-      const d = new Date(fx.fixture.date).toLocaleDateString("it-IT", { day:"2-digit", month:"2-digit", year:"2-digit" });
-      return `${d}: ${hName} ${gh}-${ga} ${aName}`;
-    }).join(" | ");
-  }
-
-  await sendTelegram(`🤖 <i>Dati raccolti. Generando l'analisi...</i>`);
-
-  // Step 5 — Genera analisi con AI
-  const match = { home, away, competition, date };
-  const extraData = { homeStanding, awayStanding, homeForm, awayForm, h2hText };
-  const analysis = await generateAnalysis(match, extraData);
-
-  return analysis;
 }
 
 // ============================================
@@ -338,7 +362,6 @@ async function prepareAndAnalyze(fixtureId, home, away, competition, date) {
 
 async function showTodayMatches() {
   await sendTelegram("⏳ <i>Carico le partite di oggi...</i>");
-
   let grouped;
   try {
     grouped = await getTopMatchesToday();
@@ -348,88 +371,95 @@ async function showTodayMatches() {
   }
 
   if (Object.keys(grouped).length === 0) {
-    await sendTelegram(
-      "😴 Nessuna partita nelle top leghe oggi.\n\n" +
-      "Puoi comunque inserire una partita manualmente con /manuale"
-    );
+    await sendTelegram("😴 Nessuna partita nelle top leghe oggi.\n\nUsa /manuale per inserire una partita a mano.");
     return;
   }
 
-  await sendTelegram("📅 <b>Partite importanti di oggi</b>\nClicca per l'analisi completa 👇");
+  await sendTelegram("📅 <b>Partite di oggi</b>\nClicca su una partita per l'analisi completa 👇");
+  await sleep(300);
 
   for (const league of Object.keys(grouped)) {
     const matches = grouped[league];
-    const emoji = LEAGUE_EMOJI[league] || "⚽";
-    let text = `${emoji} <b>${league}</b>\n`;
-
+    let text = `🏆 <b>${league}</b>\n`;
     const buttons = [];
+
     for (const fx of matches) {
       const home = fx.teams.home.name;
       const away = fx.teams.away.name;
+      const status = fx.fixture.status.short;
+      const isLive = ["1H","2H","HT","ET","P"].includes(status);
       const time = new Date(fx.fixture.date).toLocaleTimeString("it-IT", {
         hour: "2-digit", minute: "2-digit", timeZone: "Europe/Rome"
       });
-      const status = fx.fixture.status.short;
-      const isLive = ["1H","2H","HT","ET","P"].includes(status);
       text += `${isLive ? "🔴 LIVE" : `🕐 ${time}`} — ${home} vs ${away}\n`;
       buttons.push([{ text: `📊 ${home} vs ${away}`, callback_data: `a_${fx.fixture.id}` }]);
     }
 
+    text += "\n<i>Clicca per l'analisi 👆</i>";
     await sendWithButtons(text, buttons);
-    await sleep(300);
+    await sleep(400);
   }
 }
 
 // ============================================
-// GESTIONE CALLBACK (bottoni)
+// CALLBACK (bottoni cliccati)
 // ============================================
 
 async function handleCallback(cb) {
   if (!cb.data.startsWith("a_")) return;
   await answerCallback(cb.id);
-
   const fixtureId = cb.data.replace("a_", "");
 
   try {
-    const res = await apiFootball(`/fixtures?id=${fixtureId}`);
-    const f = res.response?.[0];
-    if (!f) { await sendTelegram("❌ Partita non trovata."); return; }
+    // Mostra subito i dettagli base
+    const detailsData = await apiFootball(`/fixtures?id=${fixtureId}`);
+    const fx = detailsData.response?.[0];
+    if (!fx) { await sendTelegram("❌ Partita non trovata."); return; }
 
-    const home = f.teams.home.name;
-    const away = f.teams.away.name;
-    const league = f.league.name;
-    const date = new Date(f.fixture.date).toLocaleDateString("it-IT", {
-      weekday: "long", day: "2-digit", month: "long", year: "numeric", timeZone: "Europe/Rome"
-    });
+    const home = fx.teams.home.name;
+    const away = fx.teams.away.name;
+    const league = fx.league.name;
 
     await sendTelegram(
-      `📊 <b>Analisi in preparazione</b>\n\n` +
+      `📊 <b>Analisi in preparazione</b>\n` +
       `⚽ <b>${home} vs ${away}</b>\n` +
-      `🏆 ${league}\n` +
-      `📅 ${date}\n\n` +
-      `⏳ <i>Raccogliendo dati reali... 30-60 secondi.</i>`
+      `🏆 ${league}\n\n` +
+      `🔍 <i>Raccogliendo classifica, forma e H2H reali...</i>`
     );
 
-    const analysis = await prepareAndAnalyze(fixtureId, home, away, league, date);
+    const report = await buildReport(fixtureId);
     await sleep(500);
-    await sendLong(analysis);
+    await sendLong(report);
     await sendTelegram(
-      "━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "━━━━━━━━━━━━━━━━━━━━\n" +
       "✅ <b>Report completato!</b>\n\n" +
-      "📅 Altre partite: /analisi\n" +
-      "✏️ Partita manuale: /manuale\n" +
-      "🏠 Menu: /start"
+      "📅 /analisi — altre partite di oggi\n" +
+      "✏️ /manuale — partita personalizzata"
     );
-
   } catch(e) {
-    console.error("Errore analisi:", e.message);
+    console.error("Errore report:", e.message);
     await sendTelegram("❌ Errore nella generazione. Riprova con /analisi");
   }
 }
 
 // ============================================
-// GESTIONE MESSAGGI
+// COMANDI
 // ============================================
+
+async function getUpdates() {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: "api.telegram.org",
+      path: `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`,
+      method: "GET",
+    };
+    const req = https.request(opts, (res) => {
+      let d = ""; res.on("data", c => d += c);
+      res.on("end", () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ result: [] }); } });
+    });
+    req.on("error", () => resolve({ result: [] })); req.end();
+  });
+}
 
 async function handleMessage(text) {
   text = text.trim();
@@ -438,11 +468,9 @@ async function handleMessage(text) {
     waitingFor = null; matchData = {};
     await sendTelegram(
       "⚽ <b>Match Analyst Bot</b>\n\n" +
-      "Il tuo analista tattico personale.\n\n" +
       "📅 /analisi — Partite importanti di oggi\n" +
       "✏️ /manuale — Inserisci una partita a mano\n" +
-      "ℹ️ /info — Come funziona\n\n" +
-      "<i>Dati reali + AI</i>"
+      "ℹ️ /info — Come funziona"
     );
     return;
   }
@@ -450,18 +478,13 @@ async function handleMessage(text) {
   if (text === "/info") {
     await sendTelegram(
       "ℹ️ <b>Come funziona</b>\n\n" +
-      "1️⃣ Scrivi /analisi\n" +
-      "2️⃣ Clicca la partita che ti interessa\n" +
-      "3️⃣ Il bot raccoglie dati reali (classifica, forma, H2H) e genera il report\n\n" +
-      "Il report include:\n" +
-      "• Classifica attuale con punti\n" +
-      "• Ultimi 5 risultati reali\n" +
-      "• Head to head con risultati veri\n" +
-      "• Analisi tattica\n" +
-      "• Giocatori chiave e assenze\n" +
-      "• Pronostico motivato\n" +
-      "• Quota più sicura\n\n" +
-      "⏱ Tempo medio: 30-60 secondi"
+      "Il bot raccoglie dati REALI prima di generare l'analisi:\n\n" +
+      "✅ Classifica aggiornata con punti reali\n" +
+      "✅ Ultimi 5 risultati veri con date e punteggi\n" +
+      "✅ Head to head con risultati reali\n" +
+      "✅ Analisi tattica e pronostico basati su quei dati\n" +
+      "✅ Quota più sicura\n\n" +
+      "⏱ Tempo: 30-60 secondi"
     );
     return;
   }
@@ -498,21 +521,23 @@ async function handleMessage(text) {
     matchData.date = text; waitingFor = null;
     await sendTelegram(
       `📊 <b>${matchData.home} vs ${matchData.away}</b>\n` +
-      `🏆 ${matchData.competition} — ${matchData.date}\n\n` +
-      `⏳ <i>Generando analisi con AI... 30-60 secondi.</i>`
+      `🏆 ${matchData.competition}\n\n` +
+      `⏳ <i>Generando analisi... 30-60 secondi.</i>`
     );
     try {
-      // Per manuale non abbiamo fixtureId, usiamo solo AI senza dati API
-      const analysis = await generateAnalysis(matchData, {
-        homeStanding: "cerca tu dalla classifica",
-        awayStanding: "cerca tu dalla classifica",
-        homeForm: "analizza dalla tua conoscenza",
-        awayForm: "analizza dalla tua conoscenza",
-        h2hText: "analizza dalla tua conoscenza",
-      });
-      await sleep(500);
-      await sendLong(analysis);
-      await sendTelegram("✅ <b>Report completato!</b>\n\n/analisi — partite oggi\n/start — menu");
+      const analysis = await askGroqTactics(
+        matchData.home, matchData.away, matchData.competition,
+        "non disponibile", "non disponibile",
+        "non disponibile", "non disponibile", "non disponibile"
+      );
+      await sendLong(
+        `⚽ <b>${matchData.home} vs ${matchData.away}</b>\n` +
+        `🏆 ${matchData.competition} — ${matchData.date}\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `⚠️ <i>Dati reali non disponibili per partita manuale. Analisi basata sulla conoscenza dell'AI.</i>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        analysis
+      );
     } catch(e) {
       await sendTelegram("❌ Errore. Riprova con /manuale");
     }
@@ -521,25 +546,6 @@ async function handleMessage(text) {
   }
 
   await sendTelegram("❓ Scrivi /analisi per le partite di oggi o /start per il menu.");
-}
-
-// ============================================
-// POLLING
-// ============================================
-
-async function getUpdates() {
-  return new Promise((resolve) => {
-    const opts = {
-      hostname: "api.telegram.org",
-      path: `/bot${TELEGRAM_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`,
-      method: "GET",
-    };
-    const req = https.request(opts, (res) => {
-      let data = ""; res.on("data", c => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { resolve({ result: [] }); } });
-    });
-    req.on("error", () => resolve({ result: [] })); req.end();
-  });
 }
 
 async function poll() {
@@ -553,13 +559,9 @@ async function poll() {
   }
 }
 
-// ============================================
-// AVVIO
-// ============================================
-
 async function main() {
-  console.log("⚽ Match Analyst Bot v3 avviato!");
-  await sendTelegram("⚽ <b>Match Analyst Bot v3 online!</b>\n\nScrivi /analisi per le partite di oggi.");
+  console.log("⚽ Match Analyst Bot v4 avviato!");
+  await sendTelegram("⚽ <b>Match Analyst Bot v4 online!</b>\n\nScrivi /analisi per le partite di oggi.");
   setInterval(poll, 3000);
 }
 
