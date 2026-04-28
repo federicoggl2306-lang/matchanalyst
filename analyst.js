@@ -97,16 +97,32 @@ function todayDate() {
   return new Date().toISOString().split("T")[0];
 }
 
-// Partite di oggi nelle top leghe
-async function getTopMatchesToday() {
-  const date = todayDate();
+// Cerca partite per data in tutte le top leghe
+async function fetchMatchesByDate(dateStr) {
   let allMatches = [];
   for (const leagueId of TOP_LEAGUES) {
     try {
-      const data = await apiFootball(`/fixtures?league=${leagueId}&season=${SEASON}&date=${date}`);
-      allMatches = allMatches.concat(data.response || []);
-    } catch(e) {}
+      const data = await apiFootball(`/fixtures?league=${leagueId}&season=${SEASON}&date=${dateStr}`);
+      const matches = data.response || [];
+      console.log(`Lega ${leagueId} (${dateStr}): ${matches.length} partite`);
+      allMatches = allMatches.concat(matches);
+    } catch(e) { console.error(`Errore lega ${leagueId}:`, e.message); }
   }
+  return allMatches;
+}
+
+// Partite di oggi nelle top leghe (con fallback giorni successivi)
+async function getTopMatchesToday() {
+  let allMatches = await fetchMatchesByDate(todayDate());
+
+  if (allMatches.length === 0) {
+    for (let i = 1; i <= 2; i++) {
+      const d = new Date(); d.setDate(d.getDate() + i);
+      allMatches = await fetchMatchesByDate(d.toISOString().split("T")[0]);
+      if (allMatches.length > 0) break;
+    }
+  }
+
   const grouped = {};
   for (const f of allMatches) {
     const league = f.league.name;
@@ -116,6 +132,18 @@ async function getTopMatchesToday() {
   return grouped;
 }
 
+// Cerca partita per nome squadra (per il flusso manuale con dati reali)
+async function searchFixtureByTeam(query) {
+  let allMatches = await fetchMatchesByDate(todayDate());
+  for (let i = 1; i <= 3; i++) {
+    const d = new Date(); d.setDate(d.getDate() + i);
+    allMatches = allMatches.concat(await fetchMatchesByDate(d.toISOString().split("T")[0]));
+  }
+  return allMatches.filter(f =>
+    f.teams.home.name.toLowerCase().includes(query.toLowerCase()) ||
+    f.teams.away.name.toLowerCase().includes(query.toLowerCase())
+  );
+}
 // ============================================
 // RACCOLTA DATI REALI
 // ============================================
@@ -496,52 +524,38 @@ async function handleMessage(text) {
   }
 
   if (text === "/manuale") {
-    matchData = {}; waitingFor = "home";
-    await sendTelegram("✏️ <b>Partita manuale</b>\n\nNome della <b>squadra di casa</b>:");
+    matchData = {}; waitingFor = "search";
+    await sendTelegram("✏️ <b>Cerca partita</b>\n\nScrivi il nome di una squadra:\n<i>Es: PSG, Inter, Arsenal...</i>");
     return;
   }
 
-  // Flusso manuale
-  if (waitingFor === "home") {
-    matchData.home = text; waitingFor = "away";
-    await sendTelegram(`✅ Casa: <b>${text}</b>\n\nSquadra <b>ospite</b>:`);
-    return;
-  }
-  if (waitingFor === "away") {
-    matchData.away = text; waitingFor = "competition";
-    await sendTelegram(`✅ Ospite: <b>${text}</b>\n\n<b>Competizione</b>?`);
-    return;
-  }
-  if (waitingFor === "competition") {
-    matchData.competition = text; waitingFor = "date";
-    await sendTelegram(`✅ Competizione: <b>${text}</b>\n\n<b>Data</b> della partita:`);
-    return;
-  }
-  if (waitingFor === "date") {
-    matchData.date = text; waitingFor = null;
-    await sendTelegram(
-      `📊 <b>${matchData.home} vs ${matchData.away}</b>\n` +
-      `🏆 ${matchData.competition}\n\n` +
-      `⏳ <i>Generando analisi... 30-60 secondi.</i>`
-    );
+  // Flusso ricerca manuale
+  if (waitingFor === "search") {
+    waitingFor = null;
+    const query = text;
+    await sendTelegram(`🔍 <i>Cerco partite con "${query}"...</i>`);
     try {
-      const analysis = await askGroqTactics(
-        matchData.home, matchData.away, matchData.competition,
-        "non disponibile", "non disponibile",
-        "non disponibile", "non disponibile", "non disponibile"
-      );
-      await sendLong(
-        `⚽ <b>${matchData.home} vs ${matchData.away}</b>\n` +
-        `🏆 ${matchData.competition} — ${matchData.date}\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `⚠️ <i>Dati reali non disponibili per partita manuale. Analisi basata sulla conoscenza dell'AI.</i>\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        analysis
-      );
+      const found = await searchFixtureByTeam(query);
+      if (found.length === 0) {
+        await sendTelegram(`😔 Nessuna partita trovata con "${query}" nei prossimi giorni.\n\nRiprova con un altro nome.`);
+        waitingFor = "search";
+        return;
+      }
+      // Mostra le partite trovate come bottoni
+      let text2 = `🔍 <b>Trovate ${found.length} partite:</b>\n\n`;
+      const buttons = [];
+      found.slice(0, 6).forEach(fx => {
+        const home = fx.teams.home.name;
+        const away = fx.teams.away.name;
+        const date = new Date(fx.fixture.date).toLocaleDateString("it-IT", { day:"2-digit", month:"2-digit" });
+        text2 += `📅 ${date} — ${home} vs ${away}\n`;
+        buttons.push([{ text: `📊 ${home} vs ${away}`, callback_data: `a_${fx.fixture.id}` }]);
+      });
+      text2 += "\n<i>Clicca per l'analisi 👆</i>";
+      await sendWithButtons(text2, buttons);
     } catch(e) {
-      await sendTelegram("❌ Errore. Riprova con /manuale");
+      await sendTelegram("❌ Errore nella ricerca. Riprova con /manuale");
     }
-    matchData = {};
     return;
   }
 
