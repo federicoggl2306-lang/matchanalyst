@@ -15,7 +15,9 @@ let waitingFor = null;
 let matchData = {};
 
 const TOP_LEAGUES = [2, 3, 848, 135, 39, 140, 78, 61, 94, 88, 203];
-const SEASON = new Date().getFullYear();
+// Stagione corrente: tra gen-giu la stagione è quella dellanno precedente (es. 2024 per 2024/25)
+const month = new Date().getMonth() + 1;
+const SEASON = month <= 6 ? new Date().getFullYear() - 1 : new Date().getFullYear();
 
 // ============================================
 // TELEGRAM
